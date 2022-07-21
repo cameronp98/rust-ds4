@@ -28,25 +28,33 @@ enum Button {
     L2,
     R1,
     L1,
+
+    TPad,
+    Ps
 }
 
 // see https://web.archive.org/web/20210301230721/https://www.psdevwiki.com/ps4/DS4-USB
-const PICTURE_BUTTONS: [(u8, Button); 4] = [
-    (0x80, Button::Triangle),
-    (0x40, Button::Circle),
-    (0x20, Button::X),
-    (0x10, Button::Square),
-];
-
-const OTHER_BUTTONS: [(u8, Button); 8] = [
-    (0x80, Button::R3),
-    (0x40, Button::L3),
-    (0x20, Button::Options),
-    (0x10, Button::Share),
-    (0x08, Button::R2),
-    (0x04, Button::L2),
-    (0x02, Button::R1),
-    (0x01, Button::L1),
+const BINARY_BUTTONS: &[(usize, &[(u8, Button)])] = &[
+    (5, &[
+        (0x80, Button::Triangle),
+        (0x40, Button::Circle),
+        (0x20, Button::X),
+        (0x10, Button::Square),
+    ]),
+    (6, &[
+        (0x80, Button::R3),
+        (0x40, Button::L3),
+        (0x20, Button::Options),
+        (0x10, Button::Share),
+        (0x08, Button::R2),
+        (0x04, Button::L2),
+        (0x02, Button::R1),
+        (0x01, Button::L1),
+    ]),
+    (7, &[
+        (0x02, Button::TPad),
+        (0x01, Button::Ps),
+    ])
 ];
 
 const D_PAD_MAP: [(u8, Button); 8]= [
@@ -90,34 +98,6 @@ impl ButtonEvent {
     }
 }
 
-#[derive(Debug)]
-struct ByteTracker {
-    curr: u8,
-    prev: u8,
-}
-
-fn get_events(curr: u8, prev: u8, masks: &[(u8, Button)]) -> Vec<ButtonEvent> {
-            // Find which buttons changed their state using bitwise math.
-            // changes = curr ^ prev
-            // pressed (0->1) = curr & changes
-            // released (1->0) = prev & changes
-            // -> also equivalent to !pressed & changes
-            let changes = curr ^ prev;
-            let pressed = curr & changes;
-            let released = prev & changes;
-
-            let mut events = Vec::with_capacity(16);
-
-            let to_events = |b, event_type| {
-                get_pressed_buttons(b, masks).into_iter().map(move |b| ButtonEvent::new(b, event_type))
-            };
-
-            events.extend(to_events(pressed, ButtonEventType::Pressed));
-            events.extend(to_events(released, ButtonEventType::Released));
-
-            events
-}
-
 const REPORT_SIZE: usize = 64;
 type Report = [u8; REPORT_SIZE];
 const EMPTY_REPORT: Report = [0; REPORT_SIZE];
@@ -125,6 +105,14 @@ const EMPTY_REPORT: Report = [0; REPORT_SIZE];
 struct Controller {
     device: HidDevice,
     prev_report: Cell<Report>,
+}
+
+#[inline]
+fn changes_to_events(a: u8, b: u8, event_type: ButtonEventType, masks: &[(u8, Button)]) -> Vec<ButtonEvent> {
+    let bits_set = (a ^ b) & b;
+    get_pressed_buttons(bits_set, masks)
+    .into_iter()
+    .map(move |btn| ButtonEvent::new(btn, event_type)).collect()
 }
 
 impl Controller {
@@ -139,10 +127,6 @@ impl Controller {
         api.open(1356, 2508).map(|device| Controller::new(device))
     }
 
-    fn next_report<F: FnOnce(&Report, &Report)>(&mut self, f: F) {
-
-    }
-
     fn poll_events(&self) -> HidResult<Vec<ButtonEvent>> {
         let mut report: Report = [0; 64];
         let _ = self.device.read(&mut report)?;
@@ -151,15 +135,15 @@ impl Controller {
 
         let mut events = vec![];
 
-        let mut events_if_different = |i, masks: &[(u8, Button)]| {
-            if report[i] != prev_report[i] {
-                events.extend(get_events(report[i], prev_report[i], masks));
-            }
-        };
+        for (i, masks) in BINARY_BUTTONS.iter() {
+            let curr = report[*i];
+            let prev = prev_report[*i];
 
-        // picture buttons and d-pad
-        events_if_different(5, &PICTURE_BUTTONS);
-        events_if_different(6, &OTHER_BUTTONS);
+            if curr != prev {
+                events.extend(changes_to_events(prev, curr, ButtonEventType::Pressed, &masks));
+                events.extend(changes_to_events(curr, prev, ButtonEventType::Released, &masks));
+            }
+        }
 
         // save the current report state for tracking changes.
         self.prev_report.set(report);
