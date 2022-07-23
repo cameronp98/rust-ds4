@@ -1,15 +1,10 @@
-use hidapi::{HidApi, HidResult, HidDevice};
-use std::time::Instant;
-use std::cell::Cell;
+use hidapi::{HidApi, HidDevice, HidResult};
+use std::thread;
+use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy)]
-enum Button {
-    // picture buttons
-    Triangle,
-    Circle,
-    X,
-    Square,
-    // d-pad buttons
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DPad {
+    Released,
     NorthWest,
     West,
     SouthWest,
@@ -18,108 +13,99 @@ enum Button {
     East,
     NorthEast,
     North,
-
-    // Other buttons
-    R3,
-    L3,
-    Options,
-    Share,
-    R2,
-    L2,
-    R1,
-    L1,
-
-    TPad,
-    Ps
 }
 
-// see https://web.archive.org/web/20210301230721/https://www.psdevwiki.com/ps4/DS4-USB
-const BINARY_BUTTONS: &[(usize, &[(u8, Button)])] = &[
-    (5, &[
-        (0x80, Button::Triangle),
-        (0x40, Button::Circle),
-        (0x20, Button::X),
-        (0x10, Button::Square),
-    ]),
-    (6, &[
-        (0x80, Button::R3),
-        (0x40, Button::L3),
-        (0x20, Button::Options),
-        (0x10, Button::Share),
-        (0x08, Button::R2),
-        (0x04, Button::L2),
-        (0x02, Button::R1),
-        (0x01, Button::L1),
-    ]),
-    (7, &[
-        (0x02, Button::TPad),
-        (0x01, Button::Ps),
-    ])
-];
-
-const D_PAD_MAP: [(u8, Button); 8]= [
-    (0x07, Button::NorthWest),
-    (0x06, Button::West),
-    (0x05, Button::SouthWest),
-    (0x04, Button::South),
-    (0x03, Button::SouthEast),
-    (0x02, Button::East),
-    (0x01, Button::NorthEast),
-    (0x00, Button::North),
-];
-
-fn get_pressed_buttons(b: u8, masks: &[(u8, Button)]) -> Vec<Button> {
-    masks
-        .iter()
-        .filter_map(|(mask, button)| (b & mask > 0).then(|| *button))
-        .collect()
+impl Default for DPad {
+    fn default() -> Self {
+        DPad::Released
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ButtonEventType {
-    Pressed,
-    Released,
-}
-
-#[derive(Debug)]
-struct ButtonEvent {
-    button: Button,
-    event_type: ButtonEventType,
-    instant: Instant,
-}
-
-impl ButtonEvent {
-    fn new(button: Button, event_type: ButtonEventType) -> Self {
-        ButtonEvent {
-            button,
-            event_type,
-            instant: Instant::now(),
+impl DPad {
+    fn from_byte(b: u8) -> Self {
+        match b & 0x0f {
+            0x08 => DPad::Released,
+            0x07 => DPad::NorthWest,
+            0x06 => DPad::West,
+            0x05 => DPad::SouthWest,
+            0x04 => DPad::South,
+            0x03 => DPad::SouthEast,
+            0x02 => DPad::East,
+            0x01 => DPad::NorthEast,
+            0x00 => DPad::North,
+            _ => panic!("invalid dpad value: 0b{:04b}", b),
         }
     }
 }
 
-const REPORT_SIZE: usize = 64;
-type Report = [u8; REPORT_SIZE];
-const EMPTY_REPORT: Report = [0; REPORT_SIZE];
+struct Controls {
+    triangle: Button<bool>,
+    circle: Button<bool>,
+    x: Button<bool>,
+    square: Button<bool>,
+    dpad: Button<DPad>,
+    r3: Button<bool>,
+    l3: Button<bool>,
+    options: Button<bool>,
+    share: Button<bool>,
+    r2: Button<bool>,
+    l2: Button<bool>,
+    r1: Button<bool>,
+    l1: Button<bool>,
+    tpad: Button<bool>,
+    ps: Button<bool>,
+}
+
+impl Controls {
+    fn new() -> Self {
+        Controls {
+            triangle: Button::default(),
+            circle: Button::default(),
+            x: Button::default(),
+            square: Button::default(),
+            dpad: Button::default(),
+            r3: Button::default(),
+            l3: Button::default(),
+            options: Button::default(),
+            share: Button::default(),
+            r2: Button::default(),
+            l2: Button::default(),
+            r1: Button::default(),
+            l1: Button::default(),
+            tpad: Button::default(),
+            ps: Button::default(),
+        }
+    }
+
+    fn update(&mut self, report: &[u8]) {
+        self.triangle.update(report[5] & 0x80 > 0);
+        self.circle.update(report[5] & 0x40 > 0);
+        self.x.update(report[5] & 0x20 > 0);
+        self.square.update(report[5] & 0x10 > 0);
+        self.dpad.update(DPad::from_byte(report[5]));
+        self.r3.update(report[6] & 0x80 > 0);
+        self.l3.update(report[6] & 0x40 > 0);
+        self.options.update(report[6] & 0x20 > 0);
+        self.share.update(report[6] & 0x10 > 0);
+        self.r2.update(report[6] & 0x08 > 0);
+        self.l2.update(report[6] & 0x04 > 0);
+        self.r1.update(report[6] & 0x02 > 0);
+        self.l1.update(report[6] & 0x01 > 0);
+        self.tpad.update(report[7] & 0x02 > 0);
+        self.ps.update(report[7] & 0x01 > 0);
+    }
+}
 
 struct Controller {
     device: HidDevice,
-    prev_report: Cell<Report>,
-}
-
-#[inline]
-fn changes_to_events(a: u8, b: u8, event_type: ButtonEventType, masks: &[(u8, Button)]) -> Vec<ButtonEvent> {
-    let bits_set = (a ^ b) & b;
-    get_pressed_buttons(bits_set, masks)
-    .into_iter()
-    .map(move |btn| ButtonEvent::new(btn, event_type)).collect()
+    controls: Controls,
 }
 
 impl Controller {
     fn new(device: HidDevice) -> Controller {
         Controller {
             device,
-            prev_report: Cell::new(EMPTY_REPORT),
+            controls: Controls::new(),
         }
     }
 
@@ -127,64 +113,109 @@ impl Controller {
         api.open(1356, 2508).map(|device| Controller::new(device))
     }
 
-    fn poll_events(&self) -> HidResult<Vec<ButtonEvent>> {
-        let mut report: Report = [0; 64];
+    fn update(&mut self) -> HidResult<()> {
+        let mut report = [0u8; 64];
         let _ = self.device.read(&mut report)?;
 
-        let prev_report = self.prev_report.get();
+        self.controls.update(&report);
 
-        let mut events = vec![];
+        Ok(())
+    }
+}
 
-        for (i, masks) in BINARY_BUTTONS.iter() {
-            let curr = report[*i];
-            let prev = prev_report[*i];
+struct Button<T> {
+    state: T,
+    handler: Option<ButtonHandler<T>>,
+}
 
-            if curr != prev {
-                events.extend(changes_to_events(prev, curr, ButtonEventType::Pressed, &masks));
-                events.extend(changes_to_events(curr, prev, ButtonEventType::Released, &masks));
+type ButtonHandler<T> = fn(T, T);
+
+impl<T: Default + Eq + Copy> Button<T> {
+    fn new(state: T) -> Self {
+        Button {
+            state,
+            handler: None,
+        }
+    }
+
+    fn default() -> Self {
+        Button::new(T::default())
+    }
+
+    fn set_handler(&mut self, handler: ButtonHandler<T>) {
+        self.handler = Some(handler);
+    }
+
+    fn update(&mut self, new_state: T) {
+        if self.state != new_state {
+            let old_state = self.state;
+            self.state = new_state;
+            if let Some(handler) = self.handler.as_ref() {
+                handler(old_state, new_state);
             }
         }
+    }
+}
 
-        // save the current report state for tracking changes.
-        self.prev_report.set(report);
+struct RateLimiter {
+    interval: Duration,
+    last_iter: Instant,
+}
 
-        Ok(events)
+impl RateLimiter {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_iter: Instant::now() - interval,
+        }
+    }
+
+    fn wait(&mut self) {
+        let last_iter_duration = Instant::now() - self.last_iter;
+        if last_iter_duration < self.interval {
+            let delay = self.interval - last_iter_duration;
+            thread::sleep(delay);
+        }
+
+        self.last_iter = Instant::now();
     }
 }
 
 fn main() {
     let api = HidApi::new().unwrap();
 
-    let controller = Controller::open(&api).expect("Coudln't open controller");
+    let mut controller = Controller::open(&api).expect("Coudln't open controller");
+
+    controller
+        .controls
+        .square
+        .set_handler(|old_state, new_state| {
+            if !old_state && new_state {
+                println!("SQUARE PRESSED");
+            }
+        });
+
+    controller
+        .controls
+        .triangle
+        .set_handler(|old_state, new_state| {
+            if !old_state && new_state {
+                println!("TRIANGLE PRESSED");
+            }
+        });
+
+    controller
+        .controls
+        .dpad
+        .set_handler(|old_state, new_state| {
+            println!("dpad: {:?} => {:?}", old_state, new_state);
+        });
+
+    const TARGET_FPS: u64 = 60;
+    let mut rl = RateLimiter::new(Duration::from_millis(1000 / TARGET_FPS));
 
     loop {
-        match controller.poll_events() {
-            Ok(events) => {
-                for event in events {
-                    match (event.button, event.event_type) {
-                        (Button::L1, ButtonEventType::Pressed) => {
-                            println!("Left!");
-                        },
-                        (Button::R1, ButtonEventType::Pressed) => {
-                            println!("Right");
-                        },
-                        (Button::Triangle, ButtonEventType::Pressed) => {
-                            println!("Jump");
-                        },
-                        (Button::X, ButtonEventType::Pressed) => {
-                            println!("Crouch");
-                        },
-                        (Button::Circle, ButtonEventType::Pressed) => {
-                            println!("Block");
-                        }
-                        (Button::Square, ButtonEventType::Pressed) => {
-                            println!("Attack");
-                        },
-                        _ => {},
-                    }
-                }
-            },
-            Err(e) => eprintln!("error: {}", e),
-        }
+        rl.wait();
+        controller.update().expect("failed to update controller");
     }
 }
